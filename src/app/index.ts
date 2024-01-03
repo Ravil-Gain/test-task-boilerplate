@@ -1,13 +1,15 @@
 import * as express from "express";
 import * as morgan from "morgan";
-
-import { notNil, flatten, isRightRoute, getDistance, isRightRouteV2 } from "../util";
+import { notNil, flatten, isRightRoute, getDistance } from "../util";
 import { Airport, Route, loadAirportData, loadRouteData } from "../data";
 
 export async function createApp() {
   const app = express();
+  const [airports, routes] = await Promise.all([
+    loadAirportData(),
+    loadRouteData(),
+  ]);
 
-  const airports = await loadAirportData();
   const airportsByCode = new Map<string, Airport>(
     flatten(
       airports.map((airport) =>
@@ -23,17 +25,21 @@ export async function createApp() {
     )
   );
 
-  const routes = await loadRouteData();
-
   const destinationsByAirportCode = new Map<string, Route[]>(
     flatten(
       airports.map((airport) =>
         [
           airport.iata !== null
-            ? ([airport.iata, routes.filter(r=>r.source.iata === airport.iata)] as const)
+            ? ([
+                airport.iata,
+                routes.filter((r) => r.source.iata === airport.iata),
+              ] as const)
             : null,
           airport.icao !== null
-            ? ([airport.icao, routes.filter(r=>r.source.icao === airport.icao)] as const)
+            ? ([
+                airport.icao,
+                routes.filter((r) => r.source.icao === airport.icao),
+              ] as const)
             : null,
         ].filter(notNil)
       )
@@ -42,21 +48,29 @@ export async function createApp() {
 
   function findShortestRoute(
     origin: Airport,
-    destination: Airport
+    destination: Airport,
+    mixed: boolean
   ): {
     hops: string[];
     distance: number;
   } {
-    // Placeholder implementation using a simple depth-first search
-    // Replace with a more efficient algorithm for larger datasets
-    // const visited = new Set<Airport>();
+    // check for visited airports
     const visited = new Set<String>();
+    // initial result object
     let shortestRoute = { hops: [], distance: Infinity };
-    // const straightDistance = getDistance(origin, destination);
+    // distance taken to prevent moving away
+    const straightDistance = getDistance(origin, destination) * 1.2;
+    // routes which leads to destination are final
+    const finalRoutes: Route[] = destinationsByAirportCode.get(
+      destination.iata || destination.icao
+    );
+
+    // reccuring function to keep looking path to destination
     function dfs(currentRoute: Route[], currentDistance: number): void {
+      // prevent if route is longer or too many stops
       if (
         currentDistance >= shortestRoute.distance ||
-        currentRoute.length > 5
+        currentRoute.length > 4
       ) {
         return;
       }
@@ -64,37 +78,39 @@ export async function createApp() {
       const currentAirport: Airport =
         currentRoute[currentRoute.length - 1].destination;
 
-      if (currentAirport.id === destination.id) {
-        shortestRoute = {
-          hops: [...currentRoute.map((r) => r.destination.iata)],
-          distance: currentDistance,
-        };
+      // check that we can go to destination
+      if (finalRoutes.some((r) => r.destination.id === currentAirport.id)) {
+        const lastRoute: Route = finalRoutes
+          .filter((r) => r.destination.id === currentAirport.id)
+          .sort((a, b) => a.distance - b.distance)[0];
+        const sumDistance = currentDistance + lastRoute.distance;
+        if (sumDistance < shortestRoute.distance) {
+          shortestRoute = {
+            hops: [
+              ...currentRoute.map((r) => r.destination.iata),
+              lastRoute.source.iata || lastRoute.source.icao,
+            ],
+            distance: sumDistance,
+          };
+        }
         return;
       }
 
       visited.add(currentAirport.iata || currentAirport.icao);
 
       // possible and reasonable destination airports
-      const nextRoutes =
-        destinationsByAirportCode.get(currentAirport.iata || currentAirport.icao)
-        // routes
-        //   .filter(
-        //     (r) => r.source.iata === currentAirport.iata
-        //     // r.source.icao === currentAirport.icao
-        //   )
-          .filter(
-            (r) =>
-              isRightRouteV2(
-                r,
-                destination,
-                // straightDistance - currentDistance
-              )
-            // isRightRoute(r, destination)
-          );
-      // .map((r) => r.destination);
+      const nextRoutes = destinationsByAirportCode
+        .get(currentAirport.iata || currentAirport.icao)
+        .filter((r) =>
+          isRightRoute(r, destination, straightDistance - currentDistance)
+        );
 
       for (const nextAirport of nextRoutes) {
-        if (!visited.has(nextAirport.destination.iata || nextAirport.destination.icao)) {
+        if (
+          !visited.has(
+            nextAirport.destination.iata || nextAirport.destination.icao
+          )
+        ) {
           const nextLeg = {
             source: currentAirport,
             destination: nextAirport.destination,
@@ -129,8 +145,8 @@ export async function createApp() {
 
     return res.status(200).send(airport);
   });
-
-  app.get("/routes/:source/:destination", (req, res) => {
+  app.get("/routes/:source/:destination/:searchType?", (req, res) => {
+    const mixedSearch: boolean = req.params["searchType"] === "mixed" || false;
     const source = req.params["source"];
     const destination = req.params["destination"];
     if (source === undefined || destination === undefined) {
@@ -147,10 +163,11 @@ export async function createApp() {
         .send("No such airport, please provide a valid IATA/ICAO codes");
     }
 
-
-
-    const result = findShortestRoute(sourceAirport, destinationAirport);
-    console.log(result.hops);
+    const result = findShortestRoute(
+      sourceAirport,
+      destinationAirport,
+      mixedSearch
+    );
 
     return res.status(200).send({
       source,
